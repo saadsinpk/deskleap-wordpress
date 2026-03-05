@@ -1,0 +1,42 @@
+.deskleap-settings h1 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.deskleap-logo {
+    display: inline-flex;
+    align-items: center;
+}
+
+.deskleap-card {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 4px;
+    padding: 20px 24px;
+    margin: 20px 0;
+}
+
+.deskleap-card h2 {
+    margin-top: 0;
+    padding-top: 0;
+    font-size: 1.2em;
+}
+
+.deskleap-card .description {
+    color: #646970;
+    margin-bottom: 12px;
+}
+
+.deskleap-card .form-table th {
+    padding-left: 0;
+}
+
+input[type="color"] {
+    width: 40px;
+    height: 40px;
+    padding: 2px;
+    cursor: pointer;
+    vertical-align: middle;
+    margin-right: 8px;
+}
