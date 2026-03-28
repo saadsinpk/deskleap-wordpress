@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 define( 'DESKLEAP_VERSION', '1.0.0' );
 define( 'DESKLEAP_PLUGIN_FILE', __FILE__ );
 define( 'DESKLEAP_PLUGIN_SLUG', 'deskleap' );
-define( 'DESKLEAP_GITHUB_REPO', 'saadsinpk/deskleap-wordpress' );
+define( 'DESKLEAP_UPDATE_URL', 'https://api.deskleap.io/api/wordpress/update-check' );
 define( 'DESKLEAP_WIDGET_URL', 'https://widget.deskleap.io/widget.js' );
 define( 'DESKLEAP_PORTAL_URL', 'https://portal.deskleap.io' );
 define( 'DESKLEAP_DASHBOARD_URL', 'https://app.deskleap.io/dashboard' );
@@ -426,75 +426,58 @@ function deskleap_plugin_action_links( $links ) {
 }
 
 /**
- * ─── GitHub Auto-Updater ───
+ * ─── Self-Hosted Auto-Updater ───
  *
- * Checks the GitHub releases API for a newer version.
- * When a new release is tagged (e.g. v1.1.0), WordPress will show
- * the standard "Update available" notice with one-click update.
- *
- * Release requirements:
- * - Tag must be a semver (e.g. "1.1.0" or "v1.1.0")
- * - Attach a "deskleap.zip" asset to the release (the installable plugin zip)
+ * Checks api.deskleap.io for plugin updates.
+ * - On Plugins/Updates admin pages: always fetches fresh (no cache)
+ * - Background WP cron: uses 6-hour cache as fallback
+ * - User sees "Update available" the moment they visit Plugins page
  */
 
 add_filter( 'pre_set_site_transient_update_plugins', 'deskleap_check_for_update' );
 add_filter( 'plugins_api', 'deskleap_plugin_info', 10, 3 );
 add_filter( 'upgrader_post_install', 'deskleap_after_update', 10, 3 );
 
+// Force fresh check when admin visits Plugins or Updates page.
+add_action( 'load-plugins.php', 'deskleap_clear_update_cache' );
+add_action( 'load-update-core.php', 'deskleap_clear_update_cache' );
+
+function deskleap_clear_update_cache() {
+	delete_transient( 'deskleap_update_data' );
+}
+
 /**
- * Fetch latest release data from GitHub (cached for 12 hours).
+ * Fetch latest version info from our server.
  */
-function deskleap_get_github_release() {
-	$cache_key = 'deskleap_github_release';
+function deskleap_get_update_data() {
+	$cache_key = 'deskleap_update_data';
 	$cached    = get_transient( $cache_key );
 	if ( false !== $cached ) {
 		return $cached;
 	}
 
-	$url      = 'https://api.github.com/repos/' . DESKLEAP_GITHUB_REPO . '/releases/latest';
-	$response = wp_remote_get( $url, array(
+	$response = wp_remote_get( DESKLEAP_UPDATE_URL, array(
 		'headers' => array(
-			'Accept'     => 'application/vnd.github.v3+json',
 			'User-Agent' => 'DeskLeap-WordPress-Plugin/' . DESKLEAP_VERSION,
 		),
 		'timeout' => 10,
 	) );
 
 	if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
-		// Cache failure for 1 hour to avoid hammering the API.
-		set_transient( $cache_key, null, HOUR_IN_SECONDS );
+		// Cache failure briefly to avoid hammering on errors.
+		set_transient( $cache_key, null, 15 * MINUTE_IN_SECONDS );
 		return null;
 	}
 
-	$body = json_decode( wp_remote_retrieve_body( $response ), true );
-	if ( empty( $body['tag_name'] ) ) {
-		set_transient( $cache_key, null, HOUR_IN_SECONDS );
+	$data = json_decode( wp_remote_retrieve_body( $response ), true );
+	if ( empty( $data['version'] ) ) {
+		set_transient( $cache_key, null, 15 * MINUTE_IN_SECONDS );
 		return null;
 	}
 
-	$data = array(
-		'version'      => ltrim( $body['tag_name'], 'vV' ),
-		'tag'          => $body['tag_name'],
-		'published_at' => $body['published_at'] ?? '',
-		'body'         => $body['body'] ?? '',
-		'html_url'     => $body['html_url'] ?? '',
-		'zip_url'      => '',
-	);
-
-	// Look for a deskleap.zip asset first, then fall back to the source zipball.
-	if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
-		foreach ( $body['assets'] as $asset ) {
-			if ( 'deskleap.zip' === $asset['name'] ) {
-				$data['zip_url'] = $asset['browser_download_url'];
-				break;
-			}
-		}
-	}
-	if ( empty( $data['zip_url'] ) && ! empty( $body['zipball_url'] ) ) {
-		$data['zip_url'] = $body['zipball_url'];
-	}
-
-	set_transient( $cache_key, $data, 12 * HOUR_IN_SECONDS );
+	// Cache for 6 hours (background cron fallback).
+	// On Plugins/Updates pages this cache is cleared so it always fetches fresh.
+	set_transient( $cache_key, $data, 6 * HOUR_IN_SECONDS );
 
 	return $data;
 }
@@ -507,25 +490,23 @@ function deskleap_check_for_update( $transient ) {
 		return $transient;
 	}
 
-	$release = deskleap_get_github_release();
-	if ( empty( $release ) || empty( $release['version'] ) || empty( $release['zip_url'] ) ) {
+	$remote = deskleap_get_update_data();
+	if ( empty( $remote ) || empty( $remote['version'] ) || empty( $remote['download_url'] ) ) {
 		return $transient;
 	}
 
 	$plugin_file = plugin_basename( DESKLEAP_PLUGIN_FILE );
 
-	if ( version_compare( $release['version'], DESKLEAP_VERSION, '>' ) ) {
+	if ( version_compare( $remote['version'], DESKLEAP_VERSION, '>' ) ) {
 		$transient->response[ $plugin_file ] = (object) array(
 			'slug'        => DESKLEAP_PLUGIN_SLUG,
 			'plugin'      => $plugin_file,
-			'new_version' => $release['version'],
-			'url'         => $release['html_url'],
-			'package'     => $release['zip_url'],
-			'icons'       => array(
-				'default' => 'https://deskleap.io/images/logo.png',
-			),
-			'tested'      => '6.7',
-			'requires'    => '5.8',
+			'new_version' => $remote['version'],
+			'url'         => $remote['homepage'] ?? 'https://deskleap.io',
+			'package'     => $remote['download_url'],
+			'icons'       => $remote['icons'] ?? array( 'default' => 'https://deskleap.io/images/logo.png' ),
+			'tested'      => $remote['tested'] ?? '',
+			'requires'    => $remote['requires'] ?? '',
 		);
 	}
 
@@ -533,43 +514,39 @@ function deskleap_check_for_update( $transient ) {
 }
 
 /**
- * Provide plugin info for the "View Details" modal in the updates screen.
+ * Provide plugin info for the "View Details" modal.
  */
 function deskleap_plugin_info( $result, $action, $args ) {
 	if ( 'plugin_information' !== $action || DESKLEAP_PLUGIN_SLUG !== ( $args->slug ?? '' ) ) {
 		return $result;
 	}
 
-	$release = deskleap_get_github_release();
-	if ( empty( $release ) ) {
+	$remote = deskleap_get_update_data();
+	if ( empty( $remote ) ) {
 		return $result;
 	}
 
 	return (object) array(
-		'name'          => 'DeskLeap',
+		'name'          => $remote['name'] ?? 'DeskLeap',
 		'slug'          => DESKLEAP_PLUGIN_SLUG,
-		'version'       => $release['version'],
+		'version'       => $remote['version'],
 		'author'        => '<a href="https://deskleap.io">DeskLeap</a>',
-		'homepage'      => 'https://deskleap.io',
-		'download_link' => $release['zip_url'],
-		'requires'      => '5.8',
-		'tested'        => '6.7',
-		'requires_php'  => '7.4',
-		'last_updated'  => $release['published_at'],
+		'homepage'      => $remote['homepage'] ?? 'https://deskleap.io',
+		'download_link' => $remote['download_url'],
+		'requires'      => $remote['requires'] ?? '5.8',
+		'tested'        => $remote['tested'] ?? '6.7',
+		'requires_php'  => $remote['requires_php'] ?? '7.4',
+		'last_updated'  => $remote['last_updated'] ?? '',
 		'sections'      => array(
 			'description' => 'Add DeskLeap live chat, knowledge base, and customer portal to your WordPress site.',
-			'changelog'   => nl2br( esc_html( $release['body'] ) ),
+			'changelog'   => nl2br( esc_html( $remote['changelog'] ?? '' ) ),
 		),
-		'banners'       => array(
-			'low'  => 'https://deskleap.io/images/logo.png',
-			'high' => 'https://deskleap.io/images/logo.png',
-		),
+		'banners'       => $remote['banners'] ?? array(),
 	);
 }
 
 /**
- * After update, make sure the plugin folder is named correctly.
- * GitHub source zips extract to "repo-name-tag/" — rename to "deskleap/".
+ * After update, ensure the plugin folder is named correctly and re-activate.
  */
 function deskleap_after_update( $response, $hook_extra, $result ) {
 	if ( ! isset( $hook_extra['plugin'] ) || plugin_basename( DESKLEAP_PLUGIN_FILE ) !== $hook_extra['plugin'] ) {
@@ -579,16 +556,12 @@ function deskleap_after_update( $response, $hook_extra, $result ) {
 	global $wp_filesystem;
 	$plugin_dir = WP_PLUGIN_DIR . '/' . DESKLEAP_PLUGIN_SLUG;
 
-	// If the extracted folder doesn't match our expected slug, rename it.
 	if ( isset( $result['destination'] ) && $result['destination'] !== $plugin_dir ) {
 		$wp_filesystem->move( $result['destination'], $plugin_dir );
 		$result['destination'] = $plugin_dir;
 	}
 
-	// Clear the cached release data so the next check fetches fresh info.
-	delete_transient( 'deskleap_github_release' );
-
-	// Re-activate the plugin after update.
+	delete_transient( 'deskleap_update_data' );
 	activate_plugin( plugin_basename( DESKLEAP_PLUGIN_FILE ) );
 
 	return $response;
